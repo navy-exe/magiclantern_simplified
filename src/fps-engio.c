@@ -919,6 +919,21 @@ int fps_get_current_x1000()
 {
     if (!lv)
         return 0;
+    #ifdef CONFIG_7D2
+    /* The copied TG_FREQ_BASE is uncalibrated on this port. For Canon's
+     * unmodified normal movie readout, report the selected nominal rate.
+     * VIDF timing confirms 23.976/29.970 on tested recordings. Preserve the
+     * timer path for photo/zoom/crop, overrides and unknown mode values. */
+    if (is_movie_mode() && video_mode_resolution == 0 && !video_mode_crop &&
+        lv_dispsize == 1 && !get_fps_override())
+    {
+        switch (video_mode_fps)
+        {
+            case 24: case 30: case 60: return video_mode_fps * 1000000 / 1001;
+            case 25: case 50: return video_mode_fps * 1000;
+        }
+    }
+    #endif
     int fps_timer = (get_fps_register_b() & 0xFFFF) + 1;
     int fps_x1000 = TIMER_TO_FPS_x1000(fps_timer);
     return fps_x1000;

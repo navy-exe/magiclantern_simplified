@@ -2,7 +2,8 @@
 #define _fps_h_
 /* todo: get rid of old fps.c and rename fps-engio.c */
 
-/* current LiveView FPS, as read from the timers */
+/* Current LiveView FPS, generally read from the timers. 7D2 normal movie
+ * modes use Canon's nominal rate until that port's timer clock is calibrated. */
 // This can return 0, you must check the result before doing division with it.
 // This will crash at least Digic 6 cams (ARMv7-R).
 int fps_get_current_x1000();

@@ -75,6 +75,9 @@
 #include "timer.h"
 #include "ml-cbr.h"
 #include "../../silent/lossless.h"
+#include "active_7d2.h"
+#include "fast_probe_7d2.h"
+#include "timer.h"
 #include "ml-cbr.h"
 
 THREAD_ROLE(RawRecTask);            /* our raw recording task */
@@ -166,6 +169,13 @@ static CONFIG_INT("raw.h264.proxy", h264_proxy_menu, 0);
 static CONFIG_INT("raw.sync_beep", sync_beep, 1);
 
 static CONFIG_INT("raw.output_format", output_format, 3);
+/* Local diagnostic, LLM-assisted. OFF retains upstream full-width recording. */
+static CONFIG_INT("raw.7d2.startup_test", startup_test_7d2, 0);
+static CONFIG_INT("raw.7d2.height800", height800_7d2, 0);
+static int fast_copy_segments_7d2(const struct fast_7d2_segment *, unsigned int);
+static volatile uint32_t test_copy_frames_7d2, test_copy_max_us_7d2;
+static volatile int test_copy_rc_7d2;
+static volatile int manual_stop_requested_7d2;
 #define OUTPUT_14BIT_NATIVE 0
 #define OUTPUT_12BIT_UNCOMPRESSED 1
 #define OUTPUT_10BIT_UNCOMPRESSED 2
@@ -585,6 +595,21 @@ static void refresh_cropmarks()
 static int calc_res_y(int res_x, int max_res_y, int num, int den, float squeeze)
 {
     int res_y;
+
+    /* Optional bounded height test, preserving the measured 14-bit transfer.
+     * 800 rows obey the eight-row and 16-byte payload alignment constraints. */
+    if (cam_7d2 && startup_test_7d2 == 6 && height800_7d2 &&
+        res_x == 1832 && squeeze == 1.0f && !OUTPUT_COMPRESSION &&
+        BPP == 14 && max_res_y >= 800)
+        return 800;
+
+    /* The 1832-wide 7D2 path needs eight-row alignment. The generic floor
+     * yields 1024 for 16:9; 1032 is the nearer aligned height (ideal 1030.5).
+     * Keep every other camera, format, aspect ratio and diagnostic unchanged. */
+    if (cam_7d2 && startup_test_7d2 == 6 && res_x == 1832 &&
+        num == 16 && den == 9 && squeeze == 1.0f &&
+        !OUTPUT_COMPRESSION && BPP == 14 && max_res_y >= 1032)
+        return 1032;
     
     if (squeeze != 1.0f)
     {
@@ -625,6 +650,18 @@ static int calc_res_y(int res_x, int max_res_y, int num, int den, float squeeze)
 }
 
 /* fixme: called from many tasks */
+/* Only the normal 1080 movie readout has been measured. All other modes
+ * retain their existing capture path. 14-bit only: PACK32 changes are not
+ * implemented on this camera. */
+static int use_7d2_active_area(void)
+{
+    return cam_7d2 && (startup_test_7d2 >= 2 && startup_test_7d2 <= 6) &&
+        lv && is_movie_mode() && lv_dispsize == 1 &&
+        video_mode_resolution == 0 && !video_mode_crop &&
+        raw_info.width == 1984 && raw_info.pitch == ACTIVE_7D2_SOURCE_PITCH &&
+        raw_info.bits_per_pixel == 14 && output_format == OUTPUT_14BIT_NATIVE;
+}
+
 static REQUIRES(LiveViewTask)
 void update_cropping_offsets()
 {
@@ -633,6 +670,9 @@ void update_cropping_offsets()
 
     int sx = left_margin + (max_res_x - res_x) / 2;
     int sy = top_margin  + (max_res_y - res_y) / 2;
+
+    if (use_7d2_active_area())
+        sx = ACTIVE_7D2_LEFT;
 
     if (FRAMING_PANNING)
     {
@@ -651,7 +691,7 @@ void update_cropping_offsets()
         }
     }
 
-    skip_x = sx;
+    skip_x = use_7d2_active_area() ? ACTIVE_7D2_LEFT : sx;
     skip_y = sy;
     
     refresh_cropmarks();
@@ -672,6 +712,9 @@ void update_resolution_params()
     int left_margin  = (raw_info.active_area.x1 + 7) & ~7;   /* ceil rounding to multiple of 8 pixels */
     int right_margin = (raw_info.active_area.x2 + 0) & ~7;   /* floor rounding */
     int max = (right_margin - left_margin);
+
+    if (use_7d2_active_area())
+        max = ACTIVE_7D2_WIDTH;
     
     /* max image width is modulo 2 bytes and 8 pixels */
     /* (EDMAC requires W x H to be modulo 16 bytes) */
@@ -1107,7 +1150,7 @@ static MENU_UPDATE_FUNC(resolution_update)
     {
         // We don't know how to do EDMAC rect copies yet on this cam.
         // We use a fast memcpy variant, but are limited to full width copies.
-        selected_x = raw_info.pitch * 8 / BPP;
+        selected_x = use_7d2_active_area() ? ACTIVE_7D2_WIDTH : raw_info.pitch * 8 / BPP;
     }
     
     if (selected_x > max_res_x)
@@ -2819,14 +2862,47 @@ static void compress_task()
         }
         else
         {
-            edmac_active = 1;
-            edmac_copy_rectangle_cbr_start(
+            if (cam_7d2 && res_x == ACTIVE_7D2_WIDTH)
+            {
+                /* Direct capture into a tightly packed 1832-wide slot.
+                 * Runs in the existing copy task, outside the vsync hook. */
+                edmac_active = 1;
+                uint32_t start = (uint32_t)get_us_clock();
+                int rc = -1000;
+                if (startup_test_7d2 == 6 && use_7d2_active_area() && skip_x == ACTIVE_7D2_LEFT)
+                    rc = fast_7d2_frame(UNCACHEABLE(out_ptr), frame_size_uncompressed,
+                        UNCACHEABLE(fullSizeBuffer), raw_info.frame_size,
+                        raw_info.height, skip_y, res_y, fast_copy_segments_7d2);
+                uint32_t elapsed = (uint32_t)get_us_clock() - start;
+                test_copy_rc_7d2 = rc;
+                if (rc == 0) test_copy_frames_7d2++;
+                if (elapsed > test_copy_max_us_7d2) test_copy_max_us_7d2 = elapsed;
+                edmac_active = 0;
+                if (rc != 0)
+                {
+                    buffer_full = 1;
+                    /* Never flush an unfilled slot as a valid RAW frame. */
+                    uint32_t old_int = cli();
+                    for (int q = 0; q < COUNT(writing_queue); q++)
+                        if (writing_queue[q] == slot_index)
+                            writing_queue[q] = -1;
+                    slots[slot_index].status = SLOT_FREE;
+                    sei(old_int);
+                    NotifyBox(2000, "7D2 active-area transfer failed (%d).", rc);
+                    continue;
+                }
+            }
+            else
+            {
+                edmac_active = 1;
+                edmac_copy_rectangle_cbr_start(
                 (void*)out_ptr, fullSizeBuffer,
                 raw_info.pitch, (skip_x + 7)/8*BPP, skip_y/2*2,
                 res_x * BPP/8, 0, 0,
                 res_x * BPP/8, res_y,
-                &edmac_cbr_r, &edmac_cbr_w, NULL
-            );
+                    &edmac_cbr_r, &edmac_cbr_w, NULL
+                );
+            }
         }
         
         /* mark it as completed */
@@ -3333,6 +3409,232 @@ int write_frames(FILE **pf, void *ptr, int group_size, int num_frames, int card_
 
 extern thunk ErrCardForLVApp_handler;
 
+/* Task-context diagnostics only. Closing each checkpoint makes it readable
+ * after reboot without leaving a file handle open across the next operation.
+ * No file I/O is added to vsync or the compression task. */
+static char startup_log_7d2[64];
+static int startup_checkpoint_7d2(const char *stage)
+{
+    char line[512];
+    int n = snprintf(line, sizeof(line),
+        "%d %s mode=%d raw=%dx%d pitch=%d bytes=%d out=%dx%d payload=%d slot=%d slots=%d src=%x/%x xy=%d,%d\n",
+        (int)get_ms_clock(), stage, startup_test_7d2, raw_info.width,
+        raw_info.height, raw_info.pitch, raw_info.frame_size,
+        res_x, res_y, frame_size_uncompressed, max_frame_size, valid_slot_count,
+        (unsigned int)(uintptr_t)fullsize_buffers[0],
+        (unsigned int)(uintptr_t)fullsize_buffers[1], skip_x, skip_y);
+    if (n <= 0 || (size_t)n >= sizeof(line)) return 0;
+    FILE *log = FIO_CreateFileOrAppend(startup_log_7d2);
+    if (!log) return 0;
+    int written = FIO_WriteFile(log, line, n);
+    FIO_CloseFile(log);
+    return written == n;
+}
+static int startup_log_begin_7d2(const char *stage)
+{
+    for (int i = 0; i < 1000; i++)
+    {
+        uint32_t size;
+        snprintf(startup_log_7d2, sizeof(startup_log_7d2), "ML/LOGS/RD%04d.LOG", i);
+        if (FIO_GetFileSize(startup_log_7d2, &size) != 0)
+            return startup_checkpoint_7d2(stage);
+    }
+    return 0;
+}
+static int recording_checkpoint_7d2(const char *stage)
+{
+    return !(cam_7d2 && startup_test_7d2 == 6) || startup_checkpoint_7d2(stage);
+}
+
+/* ROM-specific diagnostic entry points, never used for continuous recording.
+ * The installed core uses the single-transfer function on channel 0 already.
+ * Both wrappers synchronously acquire/release Canon's channel semaphore and
+ * perform Canon's cache maintenance. Segmented API validates count <= 8.
+ * Thumb bit is set; these addresses apply only to 7D2 firmware 1.1.2. */
+static uint32_t fast_probe_elapsed_7d2;
+static int fast_probe_control_7d2(const struct fast_7d2_segment *list, unsigned int count)
+{
+    if (!cam_7d2 || count != 1 || sizeof(*list) != 12) return -1003;
+    typedef int (*copy_fn)(int, void *, const void *, size_t);
+    copy_fn copy = (copy_fn)(uintptr_t)0xfe0ff03f;
+    uint32_t start = get_ms_clock();
+    int rc = copy(0, list[0].dst, list[0].src, list[0].bytes);
+    fast_probe_elapsed_7d2 = get_ms_clock() - start;
+    return rc;
+}
+static int fast_probe_segments_7d2(const struct fast_7d2_segment *list, unsigned int count)
+{
+    uint32_t start = get_ms_clock();
+    int rc = fast_copy_segments_7d2(list, count);
+    fast_probe_elapsed_7d2 = get_ms_clock() - start;
+    return rc;
+}
+static int fast_copy_segments_7d2(const struct fast_7d2_segment *list, unsigned int count)
+{
+    if (!cam_7d2 || count == 0 || count > 8 || sizeof(*list) != 12) return -1003;
+    typedef int (*copy_fn)(int, const struct fast_7d2_segment *, unsigned int);
+    copy_fn copy = (copy_fn)(uintptr_t)0xfe0ff0e9;
+    return copy(0, list, count);
+}
+static int fast_probe_owned_buffers_7d2(void)
+{
+    if (!cam_7d2 || !fullsize_buffers[0] || !slots[0].ptr ||
+        !raw_info.buffer || raw_info.frame_size <= 0 ||
+        raw_info.frame_size < 8 * 3472 || slots[0].size < 8 * 3206 + 128)
+        return 0;
+    uintptr_t source = (uintptr_t)CACHEABLE(fullsize_buffers[0]);
+    uintptr_t target = (uintptr_t)CACHEABLE(slots[0].ptr);
+    uintptr_t canon = (uintptr_t)CACHEABLE(raw_info.buffer);
+    if (fast_7d2_overlap(source, raw_info.frame_size, target, slots[0].size) ||
+        fast_7d2_overlap(source, raw_info.frame_size, canon, raw_info.frame_size) ||
+        fast_7d2_overlap(target, slots[0].size, canon, raw_info.frame_size))
+        return 0;
+    return 1;
+}
+static void run_fast_probe_7d2(void)
+{
+    if (!fast_probe_owned_buffers_7d2())
+    { startup_checkpoint_7d2("FAST_PROBE_BUFFERS_REJECTED"); return; }
+    /* Never write the Canon Live View buffer. Use only the separately
+     * allocated full-size buffer and an unused recorder slot. */
+    void *src = UNCACHEABLE(fullsize_buffers[0]);
+    void *dst = UNCACHEABLE(slots[0].ptr);
+    for (int test = 0; test < 3; test++)
+    {
+        const char *name = test == 0 ? "CONTROL_1X64" : test == 1 ? "SEGMENTS_2X64" : "SEGMENTS_8X3206";
+        char stage[112];
+        snprintf(stage, sizeof(stage), "BEFORE_FAST_%s", name);
+        if (!startup_checkpoint_7d2(stage)) return;
+        int rc = fast_7d2_probe(dst, slots[0].size, src, raw_info.frame_size,
+            test == 0 ? 1 : test == 1 ? 2 : 8, test < 2 ? 64 : 3206,
+            test == 0 ? fast_probe_control_7d2 : fast_probe_segments_7d2);
+        snprintf(stage, sizeof(stage), "FAST_%s_RC_%d_MS_%d", name, rc, (int)fast_probe_elapsed_7d2);
+        if (!startup_checkpoint_7d2(stage) || rc != 0) return;
+    }
+    startup_checkpoint_7d2("FAST_PROBE_COMPLETE");
+}
+
+static void run_fast_frame_benchmark_7d2(void)
+{
+    if (!fast_probe_owned_buffers_7d2() || !use_7d2_active_area() ||
+        res_x != 1832 || res_y <= 0 || res_y > 1048 || (res_y & 7) ||
+        skip_x != 144 || skip_y < 0 || (skip_y & 1) ||
+        skip_y + res_y > raw_info.height ||
+        (size_t)slots[0].size < (size_t)res_y * 3206 + 128)
+    { startup_checkpoint_7d2("FAST_FRAME_GEOMETRY_REJECTED"); return; }
+    uint8_t *src = UNCACHEABLE(fullsize_buffers[0]);
+    uint8_t *dst = UNCACHEABLE(slots[0].ptr);
+    size_t payload = (size_t)res_y * 3206;
+    if (!startup_checkpoint_7d2("BEFORE_FAST_FRAME_PATTERN")) return;
+    for (int i = 0; i < raw_info.frame_size; i++)
+        src[i] = (uint8_t)((unsigned int)i * 37 + (unsigned int)i / 257 + 81);
+    for (int trial = 1; trial <= 3; trial++)
+    {
+        for (size_t i = 0; i < payload + 128; i++) dst[i] = 0xa5;
+        char stage[112];
+        snprintf(stage, sizeof(stage), "BEFORE_FAST_FRAME_TRIAL_%d", trial);
+        if (!startup_checkpoint_7d2(stage)) return;
+        uint32_t start = (uint32_t)get_us_clock();
+        int rc = fast_7d2_frame(dst + 64, payload, src, raw_info.frame_size,
+            raw_info.height, skip_y, res_y, fast_probe_segments_7d2);
+        uint32_t elapsed = (uint32_t)get_us_clock() - start;
+        /* Verification and logging are outside the timed transfer. */
+        int verified = 0;
+        if (rc == 0)
+        {
+            for (int i = 0; i < 64; i++)
+                if (dst[i] != 0xa5 || dst[64 + payload + i] != 0xa5)
+                    verified = -1001;
+            for (int row = 0; row < res_y && verified == 0; row++)
+                for (int x = 0; x < 3206; x++)
+                {
+                    size_t i = (size_t)(skip_y + row) * 3472 + 252 + x;
+                    if (dst[64 + (size_t)row * 3206 + x] != (uint8_t)(i * 37 + i / 257 + 81))
+                    { verified = -1002; break; }
+                }
+        }
+        snprintf(stage, sizeof(stage), "FAST_FRAME_TRIAL_%d_RC_%d_US_%d_VERIFY_%d",
+            trial, rc, (int)elapsed, verified);
+        if (!startup_checkpoint_7d2(stage) || rc != 0 || verified != 0) return;
+    }
+    startup_checkpoint_7d2("FAST_FRAME_BENCHMARK_COMPLETE");
+}
+
+static void run_startup_test_7d2(void)
+{
+    /* Reject extra tasks, changed bit depth, or a proxy before touching buffers. */
+    if (card_spanning || pre_record || rec_trigger || output_format != 0 ||
+        use_h264_proxy() || !lv || !is_movie_mode() || lv_dispsize != 1 ||
+        video_mode_resolution != 0 || video_mode_crop)
+    {
+        NotifyBox(5000, "Startup test needs normal 1080, 14-bit, no triggers/proxy.");
+        return;
+    }
+    if (!startup_log_begin_7d2("ENTER"))
+    {
+        NotifyBox(5000, "Cannot create diagnostic log. Test cancelled.");
+        return;
+    }
+    take_semaphore(settings_sem, 0);
+    raw_recording_state = RAW_PREPARING;
+    give_semaphore(settings_sem);
+    powersave_prohibit();
+    if (!startup_checkpoint_7d2("BEFORE_WAIT_LV")) goto done;
+    wait_lv_frames(2);
+    if (!startup_checkpoint_7d2("BEFORE_RAW_UPDATE")) goto done;
+    raw_set_dirty();
+    if (!raw_update_params()) { startup_checkpoint_7d2("RAW_UPDATE_FAILED"); goto done; }
+    if (!startup_checkpoint_7d2("AFTER_RAW_UPDATE")) goto done;
+
+    take_semaphore(settings_sem, 0);
+    if (!startup_checkpoint_7d2("BEFORE_RESOLUTION")) goto unlock;
+    update_resolution_params();
+    if (!startup_checkpoint_7d2("AFTER_RESOLUTION")) goto unlock;
+    int buffers_ok = setup_buffers();
+    if (!startup_checkpoint_7d2(buffers_ok ? "AFTER_BUFFERS_OK" : "BUFFERS_FAILED")) goto unlock;
+    if (!buffers_ok) goto unlock;
+    setup_bit_depth();
+    if (!startup_checkpoint_7d2("AFTER_BIT_DEPTH")) goto unlock;
+    if (startup_test_7d2 == 5)
+    {
+        run_fast_frame_benchmark_7d2();
+        goto unlock;
+    }
+    if (startup_test_7d2 == 4)
+    {
+        run_fast_probe_7d2();
+        goto unlock;
+    }
+    if (startup_test_7d2 == 3)
+    {
+        if (!use_7d2_active_area() || res_x != ACTIVE_7D2_WIDTH ||
+            skip_x != ACTIVE_7D2_LEFT || !slots[0].ptr || !fullsize_buffers[0])
+        { startup_checkpoint_7d2("COPY_GEOMETRY_REJECTED"); goto unlock; }
+        if (!startup_checkpoint_7d2("BEFORE_SINGLE_COPY")) goto unlock;
+        uint32_t start = get_ms_clock();
+        int ok = active_7d2_copy(slots[0].ptr + VIDF_HDR_SIZE,
+            slots[0].payload_size, fullsize_buffers[0], raw_info.frame_size,
+            raw_info.height, skip_y, res_y);
+        uint32_t elapsed = get_ms_clock() - start;
+        char stage[80];
+        snprintf(stage, sizeof(stage), "SINGLE_COPY_%s_MS_%d", ok ? "OK" : "FAILED", (int)elapsed);
+        if (!startup_checkpoint_7d2(stage)) goto unlock;
+    }
+    startup_checkpoint_7d2("PREFLIGHT_COMPLETE");
+unlock:
+    give_semaphore(settings_sem);
+done:
+    startup_checkpoint_7d2("BEFORE_CLEANUP");
+    take_semaphore(settings_sem, 0);
+    free_buffers();
+    restore_bit_depth();
+    give_semaphore(settings_sem);
+    powersave_permit();
+    raw_recording_state = RAW_IDLE;
+    startup_checkpoint_7d2("CLEANUP_COMPLETE");
+    NotifyBox(5000, "Startup test ended. Check %s. No movie recorded.", startup_log_7d2);
+}
+
 /* note: called from raw_video_rec_task */
 /* vsync does not run at this time, so we can take its role momentarily */
 static REQUIRES(LiveViewTask)
@@ -3348,6 +3650,24 @@ void init_vsync_vars()
 static REQUIRES(RawRecTask) EXCLUDES(settings_sem)
 void raw_video_rec_task(uint32_t card_index)
 {
+    if (cam_7d2 && startup_test_7d2 > 0 && startup_test_7d2 <= 5)
+    {
+        if (card_index == 0) run_startup_test_7d2();
+        return;
+    }
+    if (cam_7d2 && startup_test_7d2 == 6)
+    {
+        if (card_index || card_spanning || pre_record || rec_trigger || use_h264_proxy() ||
+            !use_7d2_active_area())
+        { NotifyBox(5000, "Recording trial needs normal 1080, 14-bit, no triggers/proxy."); return; }
+        if (!startup_log_begin_7d2("RECORD_ENTER"))
+        { NotifyBox(5000, "Cannot create recording diagnostic log."); return; }
+        test_copy_frames_7d2 = test_copy_max_us_7d2 = 0;
+        test_copy_rc_7d2 = 0;
+        manual_stop_requested_7d2 = 0;
+        /* Early diagnostic failure must not remove the preceding clip. */
+        raw_movie_filename = NULL;
+    }
     //~ console_show();
     /* locals */
     FILE *f = 0;
@@ -3417,6 +3737,7 @@ void raw_video_rec_task(uint32_t card_index)
         wait_lv_frames(2);
 
         /* detect raw parameters (geometry, black level etc) */
+        if (!recording_checkpoint_7d2("RECORD_BEFORE_RAW_UPDATE")) goto cleanup;
         raw_set_dirty();
         if (!raw_update_params())
         {
@@ -3424,11 +3745,15 @@ void raw_video_rec_task(uint32_t card_index)
             goto cleanup;
         }
 
+        if (!recording_checkpoint_7d2("RECORD_AFTER_RAW_UPDATE")) goto cleanup;
         take_semaphore(settings_sem, 0);
         update_resolution_params();
-        setup_buffers();
+        int buffers_ok = setup_buffers();
         setup_bit_depth();
         give_semaphore(settings_sem);
+        if (cam_7d2 && startup_test_7d2 == 6 && !buffers_ok)
+        { recording_checkpoint_7d2("RECORD_BUFFERS_FAILED"); goto cleanup; }
+        if (!recording_checkpoint_7d2("RECORD_AFTER_BUFFERS")) goto cleanup;
 
         /* create output file */
         raw_movie_filename = get_next_raw_movie_file_name();
@@ -3437,6 +3762,7 @@ void raw_video_rec_task(uint32_t card_index)
             goto cleanup;
         }
         strcpy(chunk_filename[card_index], raw_movie_filename);
+        if (!recording_checkpoint_7d2("RECORD_BEFORE_FILE_CREATE")) goto cleanup;
         f = FIO_CreateFile(raw_movie_filename);
         if (!f)
         {
@@ -3456,6 +3782,7 @@ void raw_video_rec_task(uint32_t card_index)
         }
         hack_liveview(0);
         liveview_hacked = 1;
+        if (!recording_checkpoint_7d2("RECORD_AFTER_HEADERS")) goto cleanup;
 
         /* try a sync beep (not very precise, but better than nothing) */
         if(sync_beep)
@@ -3476,6 +3803,7 @@ void raw_video_rec_task(uint32_t card_index)
         set_recording_custom(CUSTOM_RECORDING_RAW);
 
         /* this will enable the vsync CBR and the other task(s) */
+        if (!recording_checkpoint_7d2("RECORD_BEFORE_VSYNC_ENABLE")) goto cleanup;
         raw_recording_state = pre_record ? RAW_PRE_RECORDING : RAW_RECORDING;
     }
     else if (card_index == 1)
@@ -3918,6 +4246,14 @@ abort_and_check_early_stop:
     }
 
 cleanup:
+    if (cam_7d2 && startup_test_7d2 == 6 && card_index == 0)
+    {
+        char stage[112];
+        snprintf(stage, sizeof(stage), "RECORD_COPY_FRAMES_%d_MAX_US_%d_LAST_RC_%d_MANUAL_%d",
+            (int)test_copy_frames_7d2, (int)test_copy_max_us_7d2, test_copy_rc_7d2,
+            manual_stop_requested_7d2);
+        recording_checkpoint_7d2(stage);
+    }
     if (f)
         finish_chunk(f, card_index);
     if (!written_total[card_index]
@@ -3958,6 +4294,7 @@ cleanup:
         ResumeLiveView();
         redraw();
         raw_recording_state = RAW_IDLE;
+        recording_checkpoint_7d2("RECORD_CLEANUP_COMPLETE");
         mlv_rec_call_cbr(MLV_REC_EVENT_STOPPED, NULL);
     }
 }
@@ -3968,6 +4305,7 @@ void raw_start_stop()
     if (!RAW_IS_IDLE)
     {
         printf("Stopping raw recording...\n");
+        if (cam_7d2 && startup_test_7d2 == 6) manual_stop_requested_7d2 = 1;
         raw_recording_state = RAW_FINISHING;
         beep();
     }
@@ -4169,6 +4507,22 @@ static struct menu_entry raw_video_menu[] =
                 .help = "Play back the last raw video clip.",
             },
             MENU_ADVANCED_TOGGLE,
+            {
+                .name = "7D2 startup test",
+                .priv = &startup_test_7d2,
+                .max = 6,
+                .choices = CHOICES("OFF", "Baseline setup", "1832 setup", "1832 single copy", "Fast copy probe", "Fast frame benchmark", "1832 manual RAW"),
+                .help = "Press REC to run the selected camera test.",
+                .help2 = "Tests 1-5: no movie. Manual RAW: press REC to start and stop.",
+            },
+            {
+                .name = "7D2 800-row trial",
+                .priv = &height800_7d2,
+                .max = 1,
+                .choices = CHOICES("OFF", "1832x800"),
+                .help = "Record 800 rows with the existing 1832-wide 14-bit transfer.",
+                .help2 = "Requires 1832 manual RAW. OFF restores aspect-ratio height.",
+            },
             MENU_EOL,
         },
     }
@@ -4535,6 +4889,10 @@ static unsigned int raw_rec_init()
     // Hide card spanning on unsupported cams
     for (struct menu_entry *e = raw_video_menu[0].children; !MENU_IS_EOL(e); e++)
     {
+        if (streq(e->name, "7D2 startup test") && !cam_7d2)
+            e->shidden = 1;
+        if (streq(e->name, "7D2 800-row trial") && !cam_7d2)
+            e->shidden = 1;
         if (!is_card_spanning_possible && streq(e->name, "Card Spanning"))
         {
             e->shidden = 1;
@@ -4630,4 +4988,6 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(sync_beep)
     MODULE_CONFIG(output_format)
     MODULE_CONFIG(h264_proxy_menu)
+    MODULE_CONFIG(startup_test_7d2)
+    MODULE_CONFIG(height800_7d2)
 MODULE_CONFIGS_END()
